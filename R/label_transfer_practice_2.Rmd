@@ -1,0 +1,238 @@
+---
+title: "label_transfer_practice_2"
+output:
+  html_document:
+    df_print: paged
+---
+# label transfer practice using seurat labeltransfer tools
+# label transfer between Brescia acute covid dataset and covid-flu dataset
+# Using the same RDS files that Can used
+
+
+```{r}
+setwd("/gpfs/gibbs/pi/csei/users/yl2485")
+library(Seurat)
+library(matrixStats)
+library(plyr)
+library(tidyverse)
+library(future)
+library(future.apply)
+plan("multisession", workers = 4)
+options(future.globals.maxSize = 20000 * 1024^2)
+library(pheatmap)
+```
+
+```{r}
+acute_covid <- readRDS(file = "data/brescia_paper1_seurat.rds")
+covid_flu <- readRDS(file = "data/GSE206265_covid_flu.CITEseq.Seurat.obj.RDS")
+```
+
+```{r}
+# remove some slots to save space
+covid_flu@assays$SCT = NULL
+acute_covid@assays$CITE <- NULL
+```
+
+```{r}
+# remove the dblt and unknown populations from the acute covid data before transfer
+remove = unique(acute_covid$WCTmergedcelltype)[str_detect(unique(acute_covid$WCTmergedcelltype), pattern = "blt|Unknown|gated")]
+remove
+```
+
+```{r}
+acute_covid = subset(acute_covid, subset = WCTmergedcelltype %in% remove, invert = TRUE)
+```
+
+```{r}
+acute_covid
+```
+
+## trasnfer using ADT data
+# transfer using PCs as anchors 
+
+```{r}
+DefaultAssay(acute_covid) = "limmaCITE"
+DefaultAssay(covid_flu) = "CITE"
+```
+
+```{r}
+acute_covid
+```
+```{r}
+covid_flu
+```
+
+```{r}
+rownames(covid_flu)
+```
+
+```{r}
+# rename the features to make them matched between 2 objects
+acute_cite_data = acute_covid@assays$limmaCITE@data
+rownames(acute_cite_data) = paste("PROT", rownames(acute_cite_data), sep = "-")
+rownames(acute_cite_data)[rownames(acute_cite_data) == "PROT-TCRVd2"] <- "PROT-TCRVdelta2"
+rownames(acute_cite_data)[rownames(acute_cite_data) == "PROT-TCRVa7.2"] <- "PROT-TCRValpha7p2"
+```
+
+```{r}
+acute_cite_data = acute_cite_data[rownames(acute_cite_data) %in% rownames(covid_flu),]
+```
+
+```{r}
+summary(rownames(acute_cite_data) %in% rownames(covid_flu))
+```
+
+```{r}
+acute_covid[["CITE"]] = CreateAssayObject(data = acute_cite_data)
+```
+
+```{r}
+DefaultAssay(acute_covid) = "CITE"
+acute_covid@assays$limmaCITE = NULL
+```
+
+```{r}
+acute_covid
+```
+
+```{r}
+covid_flu$batch = covid_flu$Batch
+```
+
+```{r}
+covid_list <- list("acute_covid" = acute_covid, "covid_flu" = covid_flu)
+```
+
+```{r}
+covid_list <- lapply(X = covid_list, FUN = function(x) {
+    x <- FindVariableFeatures(x, nfeatures = 100)
+})
+```
+
+```{r}
+features <- SelectIntegrationFeatures(object.list = covid_list)
+```
+
+```{r}
+length(features)
+```
+
+```{r}
+covid_list <- lapply(X = covid_list, FUN = function(x) {
+    x <- ScaleData(x, features = features)
+    x <- RunPCA(x, features = features)
+})
+```
+```{r}
+ElbowPlot(covid_list$covid_flu)
+```
+
+```{r}
+covid_list[1]
+```
+
+```{r}
+anchors <- FindTransferAnchors(reference = covid_list$acute_covid, query = covid_list$covid_flu, dims = 1:20)
+```
+
+```{r}
+saveRDS(anchors, file = "/gpfs/gibbs/pi/csei/users/yl2485/original_label_transfer/labeltransfer_anchors.rds")
+```
+
+```{r}
+predictions <- TransferData(anchorset = anchors, refdata = covid_list$acute_covid$WCTmergedcelltype, 
+                            dims = 1:20)
+```
+
+```{r}
+head(predictions)
+```
+
+```{r}
+covid_flu <- AddMetaData(covid_flu, metadata = predictions)
+```
+
+```{r}
+saveRDS(predictions, "labeltransfer_predictions2.rds")
+```
+
+```{r, fig.width=20, fig.height=8}
+DimPlot(covid_flu, reduction = "adt.umap", label=FALSE, raster = TRUE, group.by = "predicted.id")
+```
+
+## assign the celltypes regarding to the covid-flu names to be able to compare
+```{r}
+predictions <- readRDS("labeltransfer_predictions2.rds") %>% rownames_to_column("barcode")
+predictions_matched <- read.csv("labeltransfer_predictions_id_covidflu_map.csv")
+```
+
+```{r}
+head(predictions)
+```
+
+```{r}
+predictions_matched$predicted_id_matched <- replace(predictions_matched$predicted_id_matched, predictions_matched$predicted_id_matched == "gdT-Vd2", "gdT_Vd2")
+predictions_matched$predicted_id_matched <- replace(predictions_matched$predicted_id_matched, predictions_matched$predicted_id_matched == "Mac-or-Mono", "Mac_or_Mono")
+predictions_matched$predicted_id_matched[! (predictions_matched$predicted_id_matched %in% unique(covid_flu$cell.type))]
+```
+
+```{r}
+length(unique(predictions$predicted.id))
+```
+
+```{r}
+predictions = left_join(predictions, predictions_matched, by = c("predicted.id" = "predicted_id"))
+table(predictions$predicted.id, predictions$predicted_id_matched)
+```
+
+```{r, fig.width=20, fig.height=6}
+# add the the "truth" from curated covid-flu annotations
+identical(colnames(covid_flu), predictions$barcode)
+DimPlot(covid_flu, group.by = "predicted.id", raster = T)
+predictions$covid_flu_celltype = covid_flu$cell.type
+predictions$covid_flu_celltype = replace(predictions$covid_flu_celltype, predictions$covid_flu_celltype == "B_Naive_Intermediate", "B_Naive")
+predictions$covid_flu_coarsecelltype = covid_flu$coarse.cell.type
+```
+
+```{r}
+saveRDS(predictions, "labeltransfer_predictions_wcovidflu_celltype2.rds")
+```
+
+```{r}
+sort(unique(covid_flu$cell.type))
+```
+```{r}
+## original code
+celltype <- data.frame(table(predictions$predicted_id, predictions$covid_flu_celltype)) %>%
+  left_join(data.frame(table(predictions$predicted_id)), by = c("Var1")) %>%
+  mutate(prct = Freq.x/Freq.y*100) %>%
+  reshape2::dcast(Var1 ~ Var2, value.var = "prct") %>%
+  column_to_rownames("Var1")
+```
+
+```{r}
+head(celltype)
+```
+
+
+
+```{r}
+pheatmap(celltype,cluster_rows = FALSE, cluster_cols = FALSE)
+```
+
+
+```{r}
+celltype <- data.frame(table(predictions$predicted_id_matched, predictions$covid_flu_celltype)) %>%
+  left_join(data.frame(table(predictions$predicted_id_matched)), by = c("Var1")) %>%
+  mutate(prct = Freq.x/Freq.y*100) %>%
+  reshape2::dcast(Var1 ~ Var2, value.var = "prct") %>%
+  column_to_rownames("Var1")
+```
+
+```{r, fig.width=20, fig.height=10}
+pheatmap(celltype,cluster_rows = FALSE, cluster_cols = FALSE)
+```
+
+
+
+
